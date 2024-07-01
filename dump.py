@@ -1,4 +1,7 @@
+from sre_constants import JUMP
 import struct
+import ctypes
+import io
 import machfs
 import macresources
 import collections
@@ -7,6 +10,7 @@ import collections
 
 SYSTEM_RAM_SIZE = 0x10000
 DUMMY_ADDR = 0xFFFFFFFF
+
 
 # m68k is big endian
 def u16(x):
@@ -35,10 +39,126 @@ def u16_to_s16(x):
     return x
 
 
-def dump_file(image_filename, path, out_filename):
-    print(f"dumping {'/'.join([image_filename]+path)} to {out_filename}")
-    rsrcs = collections.defaultdict(dict)
+CALLBACK_LOADSEG = 0xAF90
 
+
+class JmpEntry(ctypes.BigEndianStructure):
+    _fields_ = (
+        ("segment_offset", ctypes.c_uint16),
+        ("type", ctypes.c_uint16),
+        ("segment_idx", ctypes.c_uint16),
+        ("callback", ctypes.c_uint16),
+    )  # 0x0008
+
+    def isUnloaded(self):
+        return self.type == 0x3F3C
+
+    def isPreloaded(self):
+        return self.type == 0x4EED
+
+    def isDynamic(self):
+        return self._0x0000 == 0xA89F
+
+    def __str__(self) -> str:
+        return "(0x%04x, 0x%04x | 0x%04x, 0x%04x)" % (
+            self.type,
+            self.segment_idx,
+            self.segment_offset,
+            self.callback,
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class CodeHeader(ctypes.BigEndianStructure):
+    _fields_ = (
+        ("above_a5_size", ctypes.c_uint32),  # 0x0000
+        ("below_a5_size", ctypes.c_uint32),  # 0x0004
+        ("jumptable_size", ctypes.c_uint32),  # 0x0008
+        ("jumptable_offset", ctypes.c_uint32),  # 0x000c
+        ("_0x0010", ctypes.c_uint32),  # 0x0010
+        ("_0x0014", ctypes.c_uint32),  # 0x0014
+        ("jmptable_type", ctypes.c_uint16),  # 0x0018
+        ("base_segment_offset", ctypes.c_uint16),  # 0x001a
+        ("segment_idx", ctypes.c_uint16),  # 0x001c
+        ("base_segment_size", ctypes.c_uint8),  # 0x001e
+        ("_0x001f", ctypes.c_uint8),  # 0x001f
+    )  # 0x0020
+
+
+def build_jumptable(header: CodeHeader, jumptable: bytes):
+    Entries = []
+
+    if header.jmptable_type != 0xA89F:
+        Buf = io.BytesIO(jumptable[0x10:])
+
+        for _ in range(0, header.jumptable_size, 8):
+            Entries.append(JmpEntry.from_buffer_copy(Buf.read(0x8)))
+
+        return Entries
+
+    Ent = JmpEntry()
+    Ent.segment_offset = header.base_segment_offset
+    Ent.type = 0x3F3C
+    Ent.segment_idx = header.segment_idx
+    Ent.callback = CALLBACK_LOADSEG
+    Entries.append(Ent)
+
+    SegNum = header.segment_idx
+    SegOffset = header.base_segment_offset
+    # SegSize = jumptable[0x1E:]
+    SegSize = io.BytesIO(jumptable[0x1F:])
+
+    # SegSize = SegSize[1:]
+
+    # this reminds me very much of some lz algorithm
+    for _ in range(8 * 3, header.jumptable_size, 8):
+        b1 = SegSize.read(1)[0]
+
+        if (b1 & 0x80) == 0:
+            SegOffset += (b1 & 0xFF) * 2
+            SegOffset &= 0xFFFF
+
+            Ent = JmpEntry()
+            Ent.segment_offset = SegOffset
+            Ent.type = 0x3F3C
+            Ent.segment_idx = SegNum
+            Ent.callback = CALLBACK_LOADSEG
+            Entries.append(Ent)
+
+        else:
+            SegOffset = ((b1 & 0x7F) << 8) | SegSize.read(1)[0]
+
+            if (SegOffset & 1) == 0:
+                Ent = JmpEntry()
+                Ent.segment_offset = SegOffset
+                Ent.type = 0x3F3C
+                Ent.segment_idx = SegNum
+                Ent.callback = CALLBACK_LOADSEG
+
+                Entries.append(Ent)
+                continue
+
+            # clear first bit
+            SegOffset &= 0x7FFE
+
+            SegNum = struct.unpack(">H", SegSize.read(2))[
+                0
+            ]  # (SegSize[0] << 8) | SegSize[1]
+
+            Ent = JmpEntry()
+            Ent.segment_offset = SegOffset
+            Ent.type = 0x3F3C
+            Ent.segment_idx = SegNum
+            Ent.callback = CALLBACK_LOADSEG
+
+            Entries.append(Ent)
+
+    return Entries
+
+
+def dump_image(image_filename, path, out_filepath):
     with open(image_filename, "rb") as f:
         flat = f.read()
         v = machfs.Volume()
@@ -46,9 +166,28 @@ def dump_file(image_filename, path, out_filename):
         print(v)
         for i in path:
             v = v[i]
-        for i in macresources.parse_file(v.rsrc):
+        resData = v.rsrc
+
+        rsrcs = collections.defaultdict(dict)
+        for i in macresources.parse_file(resData):
+            print(i)
             rsrcs[i.type][i.id] = i
 
+        return dump_resoruces(rsrcs, out_filepath)
+
+    return None
+
+
+def dump_file(path, out_filepath):
+    rsrcs = collections.defaultdict(dict)
+    for i in macresources.parse_rez_code(open(path, "rb").read()):
+        print(str(i)[:100])
+        rsrcs[i.type][i.id] = i
+
+    return dump_resoruces(rsrcs, out_filepath)
+
+
+def dump_resoruces(rsrcs, out_filename):
     for i in rsrcs:
         print(i)
         for j, r in rsrcs[i].items():
@@ -66,16 +205,29 @@ def dump_file(image_filename, path, out_filename):
     codes = rsrcs[b"CODE"]
     crels = rsrcs[b"CREL"]
 
-    jumptable = codes[0]
+    jumptable = bytes(codes[0])
 
-    above_a5_size = u32(jumptable[:4])
-    below_a5_size = u32(jumptable[4:8])
-    jump_table_size = u32(jumptable[8:12])
-    jump_table_offset = u32(jumptable[12:16])
-    assert jump_table_size == len(jumptable) - 0x10
-    assert jump_table_offset == 0x20
+    print(jumptable, len(jumptable))
+    header = CodeHeader.from_buffer_copy(jumptable)
+    jumptable_ents = build_jumptable(header, jumptable)
 
-    a5 = below_a5_size + SYSTEM_RAM_SIZE
+    for x in jumptable_ents:
+        print(x)
+
+    # above_a5_size = u32(jumptable[:4])
+    # below_a5_size = u32(jumptable[4:8])
+    # jump_table_size = u32(jumptable[8:12])
+    # jump_table_offset = u32(jumptable[12:16])
+    # print(
+    #    "%x %x | 0x%x %x"
+    #    % (above_a5_size, below_a5_size, jump_table_size, jump_table_offset)
+    # )
+    assert header.jumptable_offset == 0x20
+    # assert jump_table_size == len(jumptable) - 0x10
+    # if jump_table_size != (len(jumptable) - jump_table_offset):
+    #    jumptable = jumptable + bytes([0] * (jump_table_size - (len(jumptable) - 0x20)))
+
+    a5 = header.below_a5_size + SYSTEM_RAM_SIZE
     for i in codes:
         if i == 0:
             continue
@@ -83,22 +235,25 @@ def dump_file(image_filename, path, out_filename):
     if b"STRS" in rsrcs:
         a5 += len(rsrcs[b"STRS"][0])
 
-    dump = b""
-    header = (
+    dump = io.BytesIO()
+    junkHeader = (
         b"J\xffA\xffN\xffK\xff"  # put garbage so address 0 isn't recognized as a string
     )
     # small function to force binary ninja to set the value of a5 as a global reg
     # move.l #a5_value, a5
     # rts
-    header += b"\x2a\x7c" + p32(a5) + b"\x4e\x75"
+    junkHeader += b"\x2a\x7c" + p32(a5) + b"\x4e\x75"
 
-    system_ram = bytearray(header + bytes(SYSTEM_RAM_SIZE - len(header)))
+    system_ram = bytearray(junkHeader + bytes(SYSTEM_RAM_SIZE - len(junkHeader)))
     system_ram[0x904:0x908] = p32(a5)
-    dump += system_ram
+    # dump += system_ram
+    dump.write(system_ram)
 
+    strs_base = 0
     if b"STRS" in rsrcs:
-        strs_base = len(dump)
-        dump += rsrcs[b"STRS"][0]
+        strs_base = dump.tell()
+        dump.write(rsrcs[b"STRS"][0])
+        # dump += rsrcs[b"STRS"][0]
 
     segment_bases = {}
     for i in codes:
@@ -106,7 +261,9 @@ def dump_file(image_filename, path, out_filename):
             continue
         segment_header = codes[i][:4]
         segment_data = bytearray(codes[i][4:])
-        segment_bases[i] = len(dump)
+
+        segment_bases[i] = dump.tell()
+
         first_jumptable_entry_offset = u16(segment_header[:2])
         needs_relocations = False
         if first_jumptable_entry_offset & 0x8000:
@@ -129,27 +286,29 @@ def dump_file(image_filename, path, out_filename):
         # Think C (Symantec) relocations
         if needs_relocations and jumptable_entry_num > 0:
             # TODO: refactor
-            for j in range(0, len(crels[i]), 2):
-                addr = u16(crels[i][j : j + 2]) - 4  # -4 from header
-                if addr & 0x1:
-                    print("STRS patch ", end="")
-                    base = strs_base
-                    addr = addr & 0xFFFE
-                else:
-                    print("A5 patch ", end="")
-                    base = a5
-                data = u32(segment_data[addr : addr + 4])
-                data2 = (data + base) & 0xFFFFFFFF
-                segment_data[addr : addr + 4] = p32(data2)
-                print(f"seg {i} addr {addr:04x} ({data:08x} -> {data2:08x})")
-        dump += bytes(segment_data)
+            if i < len(crels):
+                for j in range(0, len(crels[i]), 2):
+                    addr = u16(crels[i][j : j + 2]) - 4  # -4 from header
+                    if addr & 0x1:
+                        print("STRS patch ", end="")
+                        base = strs_base
+                        addr = addr & 0xFFFE
+                    else:
+                        print("A5 patch ", end="")
+                        base = a5
+                    data = u32(segment_data[addr : addr + 4])
+                    data2 = (data + base) & 0xFFFFFFFF
+                    segment_data[addr : addr + 4] = p32(data2)
+                    print(f"seg {i} addr {addr:04x} ({data:08x} -> {data2:08x})")
+        dump.write(bytes(segment_data))
+        # dump += bytes(segment_data)
 
     # construct a5 world
     a5_world = b"\x00" * 32  # TODO pointer to quickdraw global vars
-    for i in range(0x10, len(jumptable), 8):
-        # construct a5 jumptable (all loaded jumptable entries)
-        entry = jumptable[i : i + 8]
-        if entry[2:4] == b"\x3f\x3c":
+    for ent in jumptable_ents:
+        segment_num = 0
+        addr = DUMMY_ADDR
+        if ent.isUnloaded():
             """
             unloaded jumptable entry structure:
                 XX XX: segment offset
@@ -157,36 +316,70 @@ def dump_file(image_filename, path, out_filename):
                     pushes SEGMENT_NUMBER onto the stack for _LoadSeg trap
                 a9 f0: _LoadSeg trap number
             """
-            segment_offset = u16(entry[:2])
-            segment_num = u16(entry[4:6])
-            if segment_num in segment_bases:
-                addr = segment_bases[segment_num] + segment_offset
+
+            if ent.segment_idx in segment_bases:
+                addr = segment_bases[ent.segment_idx] + ent.segment_offset
             else:
                 print(
-                    f"WARNING: code segment {segment_num} not found for jumptable entry {(i-0x10)//8}, replacing with dummy address"
+                    "Code segment %i not found for jumptable entry [%s], using dummy"
+                    % (ent.segment_idx, ent)
                 )
-                addr = DUMMY_ADDR
-        elif entry[2:4] == b"\x4e\xed":
+        elif ent.isPreloaded():
             """
             preloaded? jumptable entry structure:
                 XX XX: ???
                 4e ed XX XX: jmp OFFSET(a5)
                 4e 71: nop
             """
-            offset = u16(entry[4:6])
-            segment_num = 0  # dummy
-            addr = offset + a5
+            addr = ent.segment_idx + a5
         else:
-            print(
-                f"WARNING: unknown format for jumptable entry {(i-0x10)//8}, replacing with dummy address"
-            )
-            segment_num = 0  # dummy
-            addr = DUMMY_ADDR
+            print("jumptable entry [0x%04x] not known, using dummy" % (ent.type))
         a5_world += p16(segment_num)
         a5_world += b"\x4e\xf9"  # jmp
         a5_world += p32(addr)
 
-    below_a5_data = bytes(below_a5_size)
+    # for i in range(0x10, len(jumptable), 8):
+    #     # construct a5 jumptable (all loaded jumptable entries)
+    #     entry = jumptable[i : i + 8]
+    #     if entry[2:4] == b"\x3f\x3c":
+    #         """
+    #         unloaded jumptable entry structure:
+    #             XX XX: segment offset
+    #             3f 3c XX XX: move.w SEGMENT_NUMBER, -(SP)
+    #                 pushes SEGMENT_NUMBER onto the stack for _LoadSeg trap
+    #             a9 f0: _LoadSeg trap number
+    #         """
+    #         segment_offset = u16(entry[:2])
+    #         segment_num = u16(entry[4:6])
+    #         if segment_num in segment_bases:
+    #             addr = segment_bases[segment_num] + segment_offset
+    #         else:
+    #             print(
+    #                 f"WARNING: code segment {segment_num} not found for jumptable entry {(i-0x10)//8}, replacing with dummy address"
+    #             )
+    #             addr = DUMMY_ADDR
+    #     elif entry[2:4] == b"\x4e\xed":
+    #         """
+    #         preloaded? jumptable entry structure:
+    #             XX XX: ???
+    #             4e ed XX XX: jmp OFFSET(a5)
+    #             4e 71: nop
+    #         """
+    #         offset = u16(entry[4:6])
+    #         segment_num = 0  # dummy
+    #         addr = offset + a5
+    #     else:
+    #         print(
+    #             f"WARNING: unknown format for jumptable entry {(i-0x10)//8}, replacing with dummy address",
+    #             "0x%04x" % u16(entry[2:4]),
+    #         )
+    #         segment_num = 0  # dummy
+    #         addr = DUMMY_ADDR
+    #     a5_world += p16(segment_num)
+    #     a5_world += b"\x4e\xf9"  # jmp
+    #     a5_world += p32(addr)
+
+    below_a5_data = bytes(header.below_a5_size)
 
     if b"ZERO" in rsrcs and b"DATA" in rsrcs:
         data_rsrc = bytes(rsrcs[b"DATA"][0])
@@ -194,7 +387,7 @@ def dump_file(image_filename, path, out_filename):
         total_data_size = len(data_rsrc)
         for i in range(0, len(zero_rsrc), 2):
             total_data_size += u16(zero_rsrc[i : i + 2])
-        if total_data_size <= below_a5_size:
+        if total_data_size <= header.below_a5_size:
             print("Adding DATA below A5 world")
             below_a5_data = bytearray()
             zero_index = 0
@@ -218,23 +411,35 @@ def dump_file(image_filename, path, out_filename):
                 else:
                     print("A5 patch ", end="")
                     base = a5
-                addr += below_a5_size  # DREL relative to a5
+                addr += header.below_a5_size  # DREL relative to a5
                 data = u32(below_a5_data[addr : addr + 4])
                 data2 = (data + base) & 0xFFFFFFFF
                 below_a5_data[addr : addr + 4] = p32(data2)
                 print(f"data addr {addr:04x} ({data:08x} -> {data2:08x})")
                 i += 2
             below_a5_data = bytes(below_a5_data) + bytes(
-                below_a5_size - total_data_size
+                header.below_a5_size - total_data_size
             )
 
-    dump += below_a5_data
-    assert len(dump) == a5
-    dump += a5_world
+    # dump += below_a5_data
+    dump.write(below_a5_data)
+    # assert len(dump) == a5
+    assert dump.tell() == a5
+    # dump += a5_world
+    print("adding a5_world at 0x%x" % dump.tell())
+    dump.write(a5_world)
 
-    open(out_filename, "wb").write(dump)
+    dump.seek(0, io.SEEK_SET)
+    OutDump = dump.read()
+
+    open(out_filename, "wb").write(OutDump)
 
 
 # dump_file('HeavenEarth13Color.toast', ['Heaven & Earth'], 'dump_heavenandearth')
 # dump_file('disk2.dsk', ["System's Twilight"], 'dump_systemstwilight')
-dump_file("testfile.bin", ["Kid Pix"], "dump_kidpix")
+# dump_file("testfile.bin", ["Kid Pix"], "dump_kidpix")
+
+dump_file(
+    "/home/txt/Documents/RE/apple/data/data2/serviceutils/Display Service Utility 4.1.1/Display Service Utility.rdump",
+    "dump_dsu2",
+)
