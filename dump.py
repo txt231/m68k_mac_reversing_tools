@@ -1,10 +1,11 @@
-from sre_constants import JUMP
 import struct
 import ctypes
 import io
 import machfs
 import macresources
 import collections
+
+import vise
 
 # make custom jank dump of code
 
@@ -205,53 +206,49 @@ def dump_resoruces(rsrcs, out_filename):
     codes = rsrcs[b"CODE"]
     crels = rsrcs[b"CREL"]
 
+    ViseData = vise.scan_vise(codes)
+    if ViseData != None:
+        print("This binary is vise compressed!")
+
     jumptable = bytes(codes[0])
 
     print(jumptable, len(jumptable))
-    header = CodeHeader.from_buffer_copy(jumptable)
+    header = CodeHeader.from_buffer_copy(
+        jumptable + bytes([0] * 100)
+    )  # NOTE: gheeto fix for header size stuff
     jumptable_ents = build_jumptable(header, jumptable)
 
     for x in jumptable_ents:
         print(x)
 
-    # above_a5_size = u32(jumptable[:4])
-    # below_a5_size = u32(jumptable[4:8])
-    # jump_table_size = u32(jumptable[8:12])
-    # jump_table_offset = u32(jumptable[12:16])
-    # print(
-    #    "%x %x | 0x%x %x"
-    #    % (above_a5_size, below_a5_size, jump_table_size, jump_table_offset)
-    # )
     assert header.jumptable_offset == 0x20
-    # assert jump_table_size == len(jumptable) - 0x10
-    # if jump_table_size != (len(jumptable) - jump_table_offset):
-    #    jumptable = jumptable + bytes([0] * (jump_table_size - (len(jumptable) - 0x20)))
 
     a5 = header.below_a5_size + SYSTEM_RAM_SIZE
-    for i in codes:
-        if i == 0:
-            continue
-        a5 += len(codes[i]) - 4
-    if b"STRS" in rsrcs:
-        a5 += len(rsrcs[b"STRS"][0])
+    #     a5 += len(rsrcs[b"STRS"][0])
 
     dump = io.BytesIO()
     junkHeader = (
         b"J\xffA\xffN\xffK\xff"  # put garbage so address 0 isn't recognized as a string
     )
+
     # small function to force binary ninja to set the value of a5 as a global reg
     # move.l #a5_value, a5
     # rts
     junkHeader += b"\x2a\x7c" + p32(a5) + b"\x4e\x75"
 
     system_ram = bytearray(junkHeader + bytes(SYSTEM_RAM_SIZE - len(junkHeader)))
-    system_ram[0x904:0x908] = p32(a5)
+
+    # NOTE: we fix theese later after writing data
+    # system_ram[0x904:0x908] = p32(a5)
     # dump += system_ram
     dump.write(system_ram)
 
     strs_base = 0
     if b"STRS" in rsrcs:
         strs_base = dump.tell()
+
+        # TODO: decompress string table
+        a5 += len(rsrcs[b"STRS"][0])
         dump.write(rsrcs[b"STRS"][0])
         # dump += rsrcs[b"STRS"][0]
 
@@ -259,8 +256,19 @@ def dump_resoruces(rsrcs, out_filename):
     for i in codes:
         if i == 0:
             continue
-        segment_header = codes[i][:4]
-        segment_data = bytearray(codes[i][4:])
+
+        codeData = codes[i]
+
+        if vise.is_compressed(codeData):
+            codeData = vise.decompress(codeData, ViseData)
+
+            if codeData == None:
+                print("failed decompressing ?!")
+                continue
+            print("decompressed data!")
+
+        segment_header = codeData[:4]
+        segment_data = bytearray(codeData[4:])
 
         segment_bases[i] = dump.tell()
 
@@ -300,6 +308,8 @@ def dump_resoruces(rsrcs, out_filename):
                     data2 = (data + base) & 0xFFFFFFFF
                     segment_data[addr : addr + 4] = p32(data2)
                     print(f"seg {i} addr {addr:04x} ({data:08x} -> {data2:08x})")
+
+        a5 += len(segment_data)
         dump.write(bytes(segment_data))
         # dump += bytes(segment_data)
 
@@ -334,50 +344,11 @@ def dump_resoruces(rsrcs, out_filename):
             addr = ent.segment_idx + a5
         else:
             print("jumptable entry [0x%04x] not known, using dummy" % (ent.type))
+
+        # TODO: ghidra doesnt want to disassemble jmp? version diffrence of slaspecs??
         a5_world += p16(segment_num)
         a5_world += b"\x4e\xf9"  # jmp
         a5_world += p32(addr)
-
-    # for i in range(0x10, len(jumptable), 8):
-    #     # construct a5 jumptable (all loaded jumptable entries)
-    #     entry = jumptable[i : i + 8]
-    #     if entry[2:4] == b"\x3f\x3c":
-    #         """
-    #         unloaded jumptable entry structure:
-    #             XX XX: segment offset
-    #             3f 3c XX XX: move.w SEGMENT_NUMBER, -(SP)
-    #                 pushes SEGMENT_NUMBER onto the stack for _LoadSeg trap
-    #             a9 f0: _LoadSeg trap number
-    #         """
-    #         segment_offset = u16(entry[:2])
-    #         segment_num = u16(entry[4:6])
-    #         if segment_num in segment_bases:
-    #             addr = segment_bases[segment_num] + segment_offset
-    #         else:
-    #             print(
-    #                 f"WARNING: code segment {segment_num} not found for jumptable entry {(i-0x10)//8}, replacing with dummy address"
-    #             )
-    #             addr = DUMMY_ADDR
-    #     elif entry[2:4] == b"\x4e\xed":
-    #         """
-    #         preloaded? jumptable entry structure:
-    #             XX XX: ???
-    #             4e ed XX XX: jmp OFFSET(a5)
-    #             4e 71: nop
-    #         """
-    #         offset = u16(entry[4:6])
-    #         segment_num = 0  # dummy
-    #         addr = offset + a5
-    #     else:
-    #         print(
-    #             f"WARNING: unknown format for jumptable entry {(i-0x10)//8}, replacing with dummy address",
-    #             "0x%04x" % u16(entry[2:4]),
-    #         )
-    #         segment_num = 0  # dummy
-    #         addr = DUMMY_ADDR
-    #     a5_world += p16(segment_num)
-    #     a5_world += b"\x4e\xf9"  # jmp
-    #     a5_world += p32(addr)
 
     below_a5_data = bytes(header.below_a5_size)
 
@@ -421,6 +392,17 @@ def dump_resoruces(rsrcs, out_filename):
                 header.below_a5_size - total_data_size
             )
 
+    # write a5
+    LastPos = dump.tell()
+    dump.seek(0x8 + 0x2, io.SEEK_SET)
+    dump.write(p32(a5))
+
+    # system_ram[0x904:0x908] = p32(a5)
+    dump.seek(0x904, io.SEEK_SET)
+    dump.write(p32(a5))
+
+    dump.seek(LastPos, io.SEEK_SET)
+
     # dump += below_a5_data
     dump.write(below_a5_data)
     # assert len(dump) == a5
@@ -439,7 +421,11 @@ def dump_resoruces(rsrcs, out_filename):
 # dump_file('disk2.dsk', ["System's Twilight"], 'dump_systemstwilight')
 # dump_file("testfile.bin", ["Kid Pix"], "dump_kidpix")
 
+# dump_file(
+#     "/home/txt/Documents/RE/apple/data/data/System Folder/Control Panels/Monitors & Sound.rdump",
+#     "dump_monitorsound",
+# )
 dump_file(
     "/home/txt/Documents/RE/apple/data/data2/serviceutils/Display Service Utility 4.1.1/Display Service Utility.rdump",
-    "dump_dsu2",
+    "dump_dsu3_decomp",
 )
