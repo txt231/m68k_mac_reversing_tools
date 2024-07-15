@@ -104,7 +104,8 @@ def build_jumptable(header: CodeHeader, jumptable: bytes):
     Ent.type = 0x3F3C
     Ent.segment_idx = header.segment_idx
     Ent.callback = CALLBACK_LOADSEG
-    Entries.append(Ent)
+    Entries.append(Ent)  # this causes issues and misalignment.
+    Entries.append(Ent)  # doubler up to fix alignment?
 
     SegNum = header.segment_idx
     SegOffset = header.base_segment_offset
@@ -309,6 +310,9 @@ def dump_resoruces(rsrcs, out_filename):
                     segment_data[addr : addr + 4] = p32(data2)
                     print(f"seg {i} addr {addr:04x} ({data:08x} -> {data2:08x})")
 
+        while (dump.tell() % 0x10) != 0:
+            a5 += 1
+            dump.write(bytes([0]))
         a5 += len(segment_data)
         dump.write(bytes(segment_data))
         # dump += bytes(segment_data)
@@ -392,6 +396,9 @@ def dump_resoruces(rsrcs, out_filename):
                 header.below_a5_size - total_data_size
             )
 
+    while (a5 % 0x10) != 0:
+        a5 += 1
+
     # write a5
     LastPos = dump.tell()
     dump.seek(0x8 + 0x2, io.SEEK_SET)
@@ -406,10 +413,15 @@ def dump_resoruces(rsrcs, out_filename):
     # dump += below_a5_data
     dump.write(below_a5_data)
     # assert len(dump) == a5
-    assert dump.tell() == a5
+    if dump.tell() < a5:
+        dump.write(bytes([0] * (a5 - dump.tell())))
+
     # dump += a5_world
     print("adding a5_world at 0x%x" % dump.tell())
     dump.write(a5_world)
+
+    while (dump.tell() % 0x100) != 0:
+        dump.write(bytes([0]))
 
     dump.seek(0, io.SEEK_SET)
     OutDump = dump.read()
@@ -423,9 +435,10 @@ def dump_resoruces(rsrcs, out_filename):
 
 # dump_file(
 #     "/home/txt/Documents/RE/apple/data/data/System Folder/Control Panels/Monitors & Sound.rdump",
-#     "dump_monitorsound",
+#     "dump_monitorsound_2",
 # )
+
 dump_file(
     "/home/txt/Documents/RE/apple/data/data2/serviceutils/Display Service Utility 4.1.1/Display Service Utility.rdump",
-    "dump_dsu3_decomp",
+    "dump_dsu3_decomp3",
 )

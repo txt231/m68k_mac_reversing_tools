@@ -72,91 +72,96 @@ def decompress(data, loaderInfo=None):
         StaticTable = io.BytesIO(data[Header.unkOffset :])
 
     OutWriter = io.BytesIO()
-    while InstrReader.tell() < InstrReaderSize:
-        if False:
-            LastPos = OutWriter.tell()
-            OutWriter.seek(0, io.SEEK_SET)
 
-            print(OutWriter.read())
-            OutWriter.seek(LastPos, io.SEEK_SET)
+    try:
+        while InstrReader.tell() < InstrReaderSize:
+            if False:
+                LastPos = OutWriter.tell()
+                OutWriter.seek(0, io.SEEK_SET)
 
-        b1 = InstrReader.read(1)[0]
+                print(OutWriter.read())
+                OutWriter.seek(LastPos, io.SEEK_SET)
 
-        # print("Inst: 0x%02x | 0x%x" % (b1, OutWriter.tell()))
-        if (b1 & 1) == 0:
-            # print("\t 1")
-            # TODO: what is this static table here?
-            #
+            b1 = InstrReader.read(1)[0]
 
-            Offset = (b1 >> 1) * 2
+            # print("Inst: 0x%02x | 0x%x" % (b1, OutWriter.tell()))
+            if (b1 & 1) == 0:
+                # print("\t 1")
+                # TODO: what is this static table here?
+                #
 
-            StaticTable.seek(Offset, io.SEEK_SET)
+                Offset = (b1 >> 1) * 2
 
-            OutWriter.write(StaticTable.read(2))
+                StaticTable.seek(Offset, io.SEEK_SET)
 
-        elif (b1 & 2) == 0:
-            # print("\t 2")
-            b2 = InstrReader.read(1)[0]
+                OutWriter.write(StaticTable.read(2))
 
-            Length = ((b1 >> 2) & 7) + 1
-            Offset = (((b2 << 3) | (b1 >> 5)) + 1) * 2
+            elif (b1 & 2) == 0:
+                # print("\t 2")
+                b2 = InstrReader.read(1)[0]
 
-            # print("0x%02x, 0x%02x" % (b1, b2))
-            # print("0x%x, 0x%x" % (Offset, Length))
+                Length = ((b1 >> 2) & 7) + 1
+                Offset = (((b2 << 3) | (b1 >> 5)) + 1) * 2
 
-            # copy **WORDS** 1 by 1 to allow overlap
-            for i in range(Length + 1):
-                OutPos = OutWriter.tell()
+                # print("0x%02x, 0x%02x" % (b1, b2))
+                # print("0x%x, 0x%x" % (Offset, Length))
 
-                OutWriter.seek(OutPos - Offset, io.SEEK_SET)
-                CopyWord = OutWriter.read(2)
+                # copy **WORDS** 1 by 1 to allow overlap
+                for i in range(Length + 1):
+                    OutPos = OutWriter.tell()
 
-                OutWriter.seek(OutPos, io.SEEK_SET)
-                OutWriter.write(CopyWord)
+                    OutWriter.seek(OutPos - Offset, io.SEEK_SET)
+                    CopyWord = OutWriter.read(2)
 
-        elif (b1 & 4) == 0:
-            # print("\t 3")
-            b2 = InstrReader.read(1)[0]
+                    OutWriter.seek(OutPos, io.SEEK_SET)
+                    OutWriter.write(CopyWord)
 
-            Offset = (((b2 << 5) | (b1 >> 3)) + 0x80) * 2
+            elif (b1 & 4) == 0:
+                # print("\t 3")
+                b2 = InstrReader.read(1)[0]
 
-            if (Offset & 0x2000) != 0:
-                # copy word from table
-                OutWriter.write(TableReader.read(2))
+                Offset = (((b2 << 5) | (b1 >> 3)) + 0x80) * 2
 
-            StaticTable.seek(Offset & 0xDFFF)
-            OutWriter.write(StaticTable.read(2))
+                if (Offset & 0x2000) != 0:
+                    # copy word from table
+                    OutWriter.write(TableReader.read(2))
 
-        elif (b1 & 8) == 0:
-            # print("\t 4")
-            b2 = InstrReader.read(1)[0]
-            b3 = InstrReader.read(1)[0]
+                StaticTable.seek(Offset & 0xDFFF)
+                OutWriter.write(StaticTable.read(2))
 
-            Length = (b1 >> 4) + 1
-            Offset = ((b2 << 8) | b3) * 2
-            # print("0x%x, 0x%x" % (Offset, Length))
+            elif (b1 & 8) == 0:
+                # print("\t 4")
+                b2 = InstrReader.read(1)[0]
+                b3 = InstrReader.read(1)[0]
 
-            if Offset > 0xFFFF:
-                # copy word from table
-                OutWriter.write(TableReader.read(2))
+                Length = (b1 >> 4) + 1
+                Offset = ((b2 << 8) | b3) * 2
+                # print("0x%x, 0x%x" % (Offset, Length))
 
-            for i in range(Length + 1):
-                OutPos = OutWriter.tell()
+                if Offset > 0xFFFF:
+                    # copy word from table
+                    OutWriter.write(TableReader.read(2))
 
-                # fixed offset?
-                OutWriter.seek((Offset & 0xFFFF) + i * 2, io.SEEK_SET)
-                CopyWord = OutWriter.read(2)
+                for i in range(Length + 1):
+                    OutPos = OutWriter.tell()
 
-                OutWriter.seek(OutPos)
-                OutWriter.write(CopyWord)
-        else:
-            # print("\t 5")
-            Length = b1 >> 4
-            # print("0x%x" % Length)
+                    # fixed offset?
+                    OutWriter.seek((Offset & 0xFFFF) + i * 2, io.SEEK_SET)
+                    CopyWord = OutWriter.read(2)
 
-            for i in range(Length + 1):
-                # copy word from table
-                OutWriter.write(TableReader.read(2))
+                    OutWriter.seek(OutPos)
+                    OutWriter.write(CopyWord)
+            else:
+                # print("\t 5")
+                Length = b1 >> 4
+                # print("0x%x" % Length)
+
+                for i in range(Length + 1):
+                    # copy word from table
+                    OutWriter.write(TableReader.read(2))
+    except:
+        # ghetto way to handle end of data lmao
+        pass
 
     # if theres a trailing byte, copy it
     if (len(data) % 2) == 1:
@@ -177,8 +182,8 @@ def scan_vise(code_segs):
 
     # print(vise_loaders)
 
-    if len(vise_loaders) > 1:
-        print("Multiple vise loaders")
+    if len(vise_loaders) != 1:
+        print("Multiple or none vise loaders")
         return None
 
     # loaderInfo = vise_loaders[0][0x502:]
